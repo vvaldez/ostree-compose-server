@@ -1,0 +1,191 @@
+---
+- hosts: compose
+  tasks:
+
+  - name: "Create compose tree directory"
+    file:
+      path: /srv/{{ tree_name }}
+      state: directory
+      mode: 0755
+
+  - name: "Create cache directory"
+    file:
+      path: /srv/{{ tree_name }}/cache
+      state: directory
+      mode: 0755
+
+  - name: "Install git and rpm-ostree"
+    package:
+      name: "{{ item }}"
+      state: present
+    with_items:
+      - git
+      - rpm-ostree
+
+  - name: "Clone buildscripts repo"
+    git:
+      repo: https://github.com/CentOS/sig-atomic-buildscripts
+      dest: /srv/{{ tree_name }}/sig-atomic-buildscripts
+      version: downstream
+    ignore_errors: yes
+
+  # PR for fix is here https://pagure.io/fedora-atomic/pull-request/15
+  - name: "Apply fix for treecompose-post.sh"
+    lineinfile:
+      dest: /srv/{{ tree_name }}/sig-atomic-buildscripts/treecompose-post.sh
+      regexp: '^mv -f(.*)$'
+      line: 'cp -f\1'
+      backrefs: yes
+      state: present
+
+  - name: "Initialize ostree build repo"
+    command: "ostree --repo=/srv/{{ tree_name }}/repo-build init --mode=bare-user"
+
+  - name: "Initialize ostree export repo"
+    command: "ostree --repo=/srv/{{ tree_name }}/repo init --mode=archive"
+
+  - name: "Create Makefile target 'all'"
+    lineinfile:
+      dest: /srv/{{ tree_name }}/Makefile
+      regexp: "^all:$"
+      line: "all:"
+      state: present
+      create: yes
+
+  - name: "Create Makefile target 'all' commands"
+    lineinfile:
+      dest: /srv/{{ tree_name }}/Makefile
+      regexp: "^\trpm-ostree compose --cachedir=cache --repo=repo-build tree sig-atomic-buildscripts/centos-atomic-host.json && ostree --repo=repo pull-local repo-build && ostree --repo=repo summary -u"
+      insertafter: "^all:$"
+      line: "\trpm-ostree compose --cachedir=cache --repo=repo-build tree sig-atomic-buildscripts/centos-atomic-host.json && ostree --repo=repo pull-local repo-build && ostree --repo=repo summary -u"
+      state: present
+
+  - name: "Create Makefile target 'force'"
+    lineinfile:
+      dest: /srv/{{ tree_name }}/Makefile
+      regexp: "^force:$"
+      line: "force:"
+      state: present
+      create: yes
+
+  - name: "Create Makefile target 'force' commands"
+    lineinfile:
+      dest: /srv/{{ tree_name }}/Makefile
+      regexp: "^\trpm-ostree compose --cachedir=cache --repo=repo-build tree sig-atomic-buildscripts/centos-atomic-host.json --force-nocache && ostree --repo=repo pull-local repo-build && ostree --repo=repo summary -u"
+      insertafter: "^force:$"
+      line: "\trpm-ostree compose --cachedir=cache --repo=repo-build tree sig-atomic-buildscripts/centos-atomic-host.json --force-nocache && ostree --repo=repo pull-local repo-build && ostree --repo=repo summary -u"
+      state: present
+
+  - name: "Customize tree JSON"
+    lineinfile:
+      dest: /srv/{{ tree_name }}/sig-atomic-buildscripts/centos-atomic-host.json
+      regexp: '^    "ref":.*'
+      line: '    "ref": "{{ tree_name }}/7/x86_64/{{ branch_name }}",'
+      state: present
+
+  - name: "Comment out mirrorlist"
+    lineinfile:
+      dest: /srv/{{ tree_name }}/sig-atomic-buildscripts/CentOS-{{ item }}.repo
+      regexp: '^mirrorlist=(.*)$'
+      line: '#mirrorlist=\1'
+      backrefs: yes
+      state: present
+    with_items:
+      - Base
+      - updates
+      - extras
+
+  - name: "Change baseurl to local repo"
+    lineinfile:
+      dest: /srv/{{ tree_name }}/sig-atomic-buildscripts/CentOS-{{ item.filename }}.repo
+      regexp: '^#baseurl=(.*)$'
+      line: 'baseurl=http://{{ repo_server }}/repos/{{ item.repo }}/'
+      backrefs: yes
+      state: present
+    with_items:
+      - { filename: 'Base', repo: 'base'}
+      - { filename: 'updates', repo: 'updates'}
+      - { filename: 'extras', repo: 'extras'}
+
+  - name: "Change GPG key to local repo"
+    lineinfile:
+      dest: /srv/{{ tree_name }}/sig-atomic-buildscripts/CentOS-{{ item }}.repo
+      regexp: '^gpgkey=(.*)'
+      line: "gpgkey=http://{{ repo_server }}/repos/base/RPM-GPG-KEY-CentOS-7"
+      backrefs: yes
+      state: present
+    with_items:
+      - Base
+      - updates
+      - extras
+
+# This make job can be run as part of the playbook but output will not be shown until it is finished
+  - name: "Make tree (this will take over 5 minutes)"
+    make:
+      chdir: /srv/{{ tree_name }}
+    register: make_output
+
+  - debug:
+      var: make_output.stdout_lines
+
+# Optionally use a pause if you want to manually run make to see the output live
+#  - pause:
+#      prompt: "Run 'make' manually on {{ compose_server }} in /srv/{{ tree_name }} then press ENTER to continue here"
+
+- hosts: atomic
+  tasks:
+
+  - name: "View atomic host status"
+    command: atomic host status
+    register: atomic_host_status
+
+  - debug:
+      var: atomic_host_status.stdout_lines
+
+  - name: "List remotes"
+    command: ostree remote list
+    register: ostree_remote_list
+
+  - debug:
+      var: ostree_remote_list.stdout_lines
+
+  - name: "Add Custom ostree remote to atomic hosts"
+    command: 'ostree remote add {{ tree_name }}-{{ branch_name}} --no-gpg-verify http://{{ compose_server }}/srv/{{ tree_name }}/repo/'
+
+  - name: "List remotes"
+    command: ostree remote list
+    register: ostree_remote_list
+
+  - debug:
+      var: ostree_remote_list.stdout_lines
+
+  - name: "List remote refs"
+    command: ostree remote refs {{ tree_name }}-{{ branch_name }}
+    register: ostree_remote_refs_list
+
+  - debug:
+      var: ostree_remote_refs_list.stdout_lines
+
+  - name: "Rebase to new tree"
+    command: "rpm-ostree rebase {{ tree_name }}-{{ branch_name }}{{':'}}{{ tree_name }}/7/x86_64/{{ branch_name }}"
+
+  - name: "View atomic host status"
+    command: atomic host status
+    register: atomic_host_status
+
+  - debug:
+      var: atomic_host_status.stdout_lines
+
+  - name: "Reboot Atomic Host"
+    shell: 'sleep 2 && systemctl reboot'
+    async: 1
+    poll: 0
+    ignore_errors: true
+
+  - name: "Wait for reboot"
+    local_action:
+      module: wait_for
+        host={{ inventory_hostname }}
+        port=22
+        delay=5
+        timeout=900

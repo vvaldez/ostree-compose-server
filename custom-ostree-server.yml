@@ -189,3 +189,11 @@
         port=22
         delay=5
         timeout=900
+
+  - name: "View atomic host status"
+    command: atomic host status
+    register: atomic_host_status
+
+  - debug:
+      var: atomic_host_status.stdout_lines
+
